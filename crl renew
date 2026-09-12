@@ -1,0 +1,43 @@
+#!/bin/bash
+# CRL renewal automation - run via cron, well before default_crl_days expires.
+# Regenerates CRL, converts to DER, and publishes to a web-accessible path.
+set -e
+
+PKI_DIR="/opt/pki/intermediate"          # adjust to your actual path
+PUBLISH_DIR="/var/www/pki/crl"           # where clients fetch the CRL from
+LOG="/var/log/pki-crl-renew.log"
+
+cd "$PKI_DIR"
+
+echo "$(date -Is) [+] Regenerating CRL" >> "$LOG"
+
+# Regenerate CRL (requires CA private key passphrase — see note below)
+openssl ca -config openssl.cnf -gencrl -out crl/intermediate-ca.crl.pem \
+  >> "$LOG" 2>&1
+
+# Convert to DER for broader client compatibility
+openssl crl -in crl/intermediate-ca.crl.pem -outform DER \
+  -out crl/intermediate-ca.crl
+
+# Verify the new CRL is valid before publishing
+if openssl crl -in crl/intermediate-ca.crl.pem -noout -text > /dev/null 2>&1; then
+  cp crl/intermediate-ca.crl.pem "$PUBLISH_DIR/"
+  cp crl/intermediate-ca.crl "$PUBLISH_DIR/"
+  echo "$(date -Is) [+] CRL published to $PUBLISH_DIR" >> "$LOG"
+else
+  echo "$(date -Is) [!] CRL validation FAILED - not published" >> "$LOG"
+  exit 1
+fi
+
+# Alert if CRL nextUpdate is closer than 3 days (sanity check post-publish)
+NEXT_UPDATE=$(openssl crl -in crl/intermediate-ca.crl.pem -noout -nextupdate \
+  | cut -d= -f2)
+NEXT_EPOCH=$(date -d "$NEXT_UPDATE" +%s)
+NOW_EPOCH=$(date +%s)
+DAYS_LEFT=$(( (NEXT_EPOCH - NOW_EPOCH) / 86400 ))
+
+if [ "$DAYS_LEFT" -lt 3 ]; then
+  echo "$(date -Is) [!] WARNING: CRL nextUpdate in ${DAYS_LEFT}d - cron interval may be too long" >> "$LOG"
+fi
+
+echo "$(date -Is) [+] Done. Next update: $NEXT_UPDATE" >> "$LOG"
