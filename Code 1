@@ -1,0 +1,125 @@
+#!/bin/bash
+# Simple 3-tier PKI setup: Root CA -> Intermediate CA -> Leaf cert
+# Usage: ./setup-pki.sh
+set -e
+
+BASE="./pki"
+DAYS_ROOT=3650      # 10 years
+DAYS_INTERMEDIATE=1825   # 5 years
+DAYS_LEAF=825        # ~2 years (browser max)
+
+mkdir -p $BASE/{root,intermediate}/{certs,crl,newcerts,private,csr}
+cd $BASE
+
+# --- Root CA ---
+cd root
+touch index.txt
+echo 1000 > serial
+cat > openssl.cnf <<'EOF'
+[ ca ]
+default_ca = CA_default
+[ CA_default ]
+dir             = .
+database        = index.txt
+new_certs_dir   = newcerts
+serial          = serial
+private_key     = private/root-ca.key.pem
+certificate     = certs/root-ca.cert.pem
+default_md      = sha256
+policy          = policy_loose
+[ policy_loose ]
+countryName             = optional
+stateOrProvinceName     = optional
+organizationName        = optional
+commonName              = supplied
+[ req ]
+distinguished_name = req_distinguished_name
+prompt = no
+[ req_distinguished_name ]
+C  = KE
+O  = MyOrg
+CN = MyOrg Root CA
+[ v3_ca ]
+basicConstraints = critical, CA:true
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+EOF
+
+echo "[+] Generating Root CA key (offline/air-gapped in production!)"
+openssl genrsa -aes256 -out private/root-ca.key.pem 4096
+chmod 400 private/root-ca.key.pem
+
+echo "[+] Generating self-signed Root CA cert"
+openssl req -config openssl.cnf -key private/root-ca.key.pem \
+  -new -x509 -days $DAYS_ROOT -sha256 -extensions v3_ca \
+  -out certs/root-ca.cert.pem
+
+cd ../intermediate
+
+# --- Intermediate CA ---
+touch index.txt
+echo 1000 > serial
+cat > openssl.cnf <<'EOF'
+[ req ]
+distinguished_name = req_distinguished_name
+prompt = no
+[ req_distinguished_name ]
+C  = KE
+O  = MyOrg
+CN = MyOrg Intermediate CA
+[ v3_intermediate_ca ]
+basicConstraints = critical, CA:true, pathlen:0
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer
+EOF
+
+echo "[+] Generating Intermediate CA key + CSR"
+openssl genrsa -aes256 -out private/intermediate-ca.key.pem 4096
+chmod 400 private/intermediate-ca.key.pem
+openssl req -config openssl.cnf -new -sha256 \
+  -key private/intermediate-ca.key.pem \
+  -out csr/intermediate-ca.csr.pem
+
+echo "[+] Root CA signs Intermediate CA cert"
+cd ../root
+openssl ca -config openssl.cnf -extensions v3_ca -days $DAYS_INTERMEDIATE \
+  -notext -md sha256 -batch \
+  -in ../intermediate/csr/intermediate-ca.csr.pem \
+  -out ../intermediate/certs/intermediate-ca.cert.pem
+
+# Build chain
+cat ../intermediate/certs/intermediate-ca.cert.pem certs/root-ca.cert.pem \
+  > ../intermediate/certs/ca-chain.cert.pem
+
+cd ../intermediate
+
+# --- Leaf cert (example: a server) ---
+echo "[+] Generating leaf key + CSR for server.myorg.local"
+openssl genrsa -out private/server.key.pem 2048
+openssl req -new -sha256 -key private/server.key.pem \
+  -subj "/C=KE/O=MyOrg/CN=server.myorg.local" \
+  -out csr/server.csr.pem
+
+cat > leaf_ext.cnf <<'EOF'
+basicConstraints = CA:FALSE
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:server.myorg.local
+authorityKeyIdentifier = keyid,issuer
+EOF
+
+echo "[+] Intermediate CA signs leaf cert"
+openssl ca -config openssl.cnf -days $DAYS_LEAF -notext -md sha256 -batch \
+  -extfile leaf_ext.cnf \
+  -in csr/server.csr.pem \
+  -out certs/server.cert.pem
+
+echo "[+] Done. Chain: intermediate/certs/ca-chain.cert.pem"
+echo "[+] Leaf cert: intermediate/certs/server.cert.pem"
+echo "[+] Leaf key:  intermediate/private/server.key.pem"
+
+# Verify
+openssl verify -CAfile ../root/certs/root-ca.cert.pem \
+  -untrusted certs/intermediate-ca.cert.pem \
+  certs/server.cert.pem
