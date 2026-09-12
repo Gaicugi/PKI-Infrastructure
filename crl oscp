@@ -1,0 +1,80 @@
+#!/bin/bash
+# Adds CRL publishing + OCSP responder to the PKI built by setup-pki.sh
+# Run this AFTER setup-pki.sh, from the same directory.
+set -e
+
+BASE="./pki"
+cd $BASE/intermediate
+
+# --- 1. CRL: generate + config ---
+echo "[+] Adding CRL extension to intermediate openssl.cnf"
+cat >> openssl.cnf <<'EOF'
+
+[ crl_ext ]
+authorityKeyIdentifier = keyid:always
+EOF
+
+# Add crl_extensions + default_crl_days to CA_default if not present
+if ! grep -q "crlnumber" openssl.cnf; then
+  echo 1000 > crlnumber
+  sed -i '/\[ req \]/i default_crl_days = 30\ncrlnumber = crlnumber\ncrl_extensions = crl_ext\n' openssl.cnf
+fi
+
+echo "[+] Generating initial CRL"
+openssl ca -config openssl.cnf -gencrl -out crl/intermediate-ca.crl.pem
+
+# Convert to DER (some clients/browsers expect DER not PEM)
+openssl crl -in crl/intermediate-ca.crl.pem -outform DER -out crl/intermediate-ca.crl
+
+echo "[+] CRL created: crl/intermediate-ca.crl.pem (PEM) / .crl (DER)"
+echo "    Host this at a URL, e.g. http://pki.myorg.local/crl/intermediate-ca.crl"
+echo "    and reference it in leaf certs via crlDistributionPoints"
+
+# --- 2. Add CDP + OCSP AIA extension to future leaf certs ---
+cat > leaf_ext_with_revocation.cnf <<'EOF'
+basicConstraints = CA:FALSE
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:server.myorg.local
+authorityKeyIdentifier = keyid,issuer
+crlDistributionPoints = URI:http://pki.myorg.local/crl/intermediate-ca.crl
+authorityInfoAccess = OCSP;URI:http://pki.myorg.local:2560
+EOF
+echo "[+] New leaf cert template written: leaf_ext_with_revocation.cnf"
+echo "    Re-sign leaf certs using this extfile to include CDP/OCSP URLs"
+
+# --- 3. OCSP responder cert (signed by intermediate CA) ---
+echo "[+] Generating dedicated OCSP signing cert"
+openssl genrsa -out private/ocsp.key.pem 2048
+openssl req -new -sha256 -key private/ocsp.key.pem \
+  -subj "/C=KE/O=MyOrg/CN=OCSP Responder" \
+  -out csr/ocsp.csr.pem
+
+cat > ocsp_ext.cnf <<'EOF'
+basicConstraints = CA:FALSE
+keyUsage = critical, digitalSignature
+extendedKeyUsage = OCSPSigning
+authorityKeyIdentifier = keyid,issuer
+EOF
+
+openssl ca -config openssl.cnf -days 375 -notext -md sha256 -batch \
+  -extfile ocsp_ext.cnf \
+  -in csr/ocsp.csr.pem \
+  -out certs/ocsp.cert.pem
+
+echo "[+] OCSP responder cert: certs/ocsp.cert.pem"
+echo ""
+echo "[+] To run a live OCSP responder for testing:"
+echo "openssl ocsp -index index.txt -port 2560 \\"
+echo "  -rsigner certs/ocsp.cert.pem -rkey private/ocsp.key.pem \\"
+echo "  -CA certs/ca-chain.cert.pem -text -out ocsp.log"
+echo ""
+echo "[+] Test a cert's revocation status against it:"
+echo "openssl ocsp -CAfile certs/ca-chain.cert.pem \\"
+echo "  -url http://127.0.0.1:2560 -resp_text \\"
+echo "  -issuer certs/intermediate-ca.cert.pem \\"
+echo "  -cert certs/server.cert.pem"
+echo ""
+echo "[+] To revoke a cert:"
+echo "openssl ca -config openssl.cnf -revoke certs/server.cert.pem"
+echo "openssl ca -config openssl.cnf -gencrl -out crl/intermediate-ca.crl.pem"
