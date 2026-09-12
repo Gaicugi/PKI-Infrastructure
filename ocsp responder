@@ -1,0 +1,5 @@
+sudo useradd -r -s /nologin ocsp-svc
+sudo cp ocsp-responder.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ocsp-responder
+sudo systemctl status ocsp-responder
